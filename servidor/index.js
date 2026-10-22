@@ -43,16 +43,20 @@ client.on('auth_failure', msg => console.error('Falha na autenticação:', msg))
 client.initialize();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ type: '*/*' }));
 
 app.get('/saude', (req, res) => {
   res.json({ whatsapp: pronto });
 });
 
 app.post('/enviar', async (req, res) => {
-  if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+  const tokenRecebido =
+    (req.headers.authorization || '').replace('Bearer ', '') || req.query.token;
+  if (tokenRecebido !== TOKEN) {
     return res.sendStatus(401);
   }
+
+  
   if (!pronto) {
     return res.status(503).send('WhatsApp ainda não está pronto');
   }
