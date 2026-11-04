@@ -1,7 +1,10 @@
-require('dotenv').config();
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const express = require('express');
+import 'dotenv/config';
+import express from 'express';
+import pino from 'pino';
+import QRCode from 'qrcode';
+import qrcodeTerminal from 'qrcode-terminal';
+import makeWASocket, { Browsers, DisconnectReason } from '@whiskeysockets/baileys';
+import { initDb, useDbAuthState } from './auth-db.js';
 
 const { TOKEN, GRUPO_ID, PORT = 3000 } = process.env;
 
@@ -11,55 +14,81 @@ if (!TOKEN || !GRUPO_ID) {
 }
 
 process.on('unhandledRejection', err => {
-  console.error('Erro não tratado (ignorado):', err && err.message ? err.message : err);
+  console.error('Erro não tratado (ignorado):', err?.message ?? err);
 });
 
+const logger = pino({ level: 'warn' });
+
+let sock = null;
 let pronto = false;
+let qrAtual = null;
 
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] },
-});
+async function conectar() {
+  const { state, saveCreds, clear } = await useDbAuthState('default');
 
-client.on('qr', qr => {
-  console.log('Escaneie o QR code com o WhatsApp:');
-  qrcode.generate(qr, { small: true });
-});
+  sock = makeWASocket({
+    auth: state,
+    logger,
+    browser: Browsers.ubuntu('pix-notify'),
+    markOnlineOnConnect: false,
+  });
 
-client.on('authenticated', () => console.log('Autenticado'));
+  sock.ev.on('creds.update', saveCreds);
 
-client.on('ready', () => {
-  pronto = true;
-  console.log('WhatsApp conectado!');
-});
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      qrAtual = qr;
+      console.log('Escaneie o QR code (ou abra /qr?token=SEU_TOKEN):');
+      qrcodeTerminal.generate(qr, { small: true });
+    }
 
-client.on('disconnected', reason => {
-  pronto = false;
-  console.error('WhatsApp desconectado:', reason);
-});
+    if (connection === 'open') {
+      pronto = true;
+      qrAtual = null;
+      console.log('WhatsApp conectado!');
+    }
 
-client.on('auth_failure', msg => console.error('Falha na autenticação:', msg));
+    if (connection === 'close') {
+      pronto = false;
+      const codigo = lastDisconnect?.error?.output?.statusCode;
 
-client.initialize();
+      if (codigo === DisconnectReason.loggedOut) {
+        console.error('Sessão encerrada pelo WhatsApp. Limpando e gerando novo QR...');
+        await clear();
+      } else {
+        console.error(`Conexão fechada (código ${codigo}). Reconectando...`);
+      }
+
+      setTimeout(conectar, 3000);
+    }
+  });
+}
 
 const app = express();
 app.use(express.json({ type: '*/*' }));
+
+function autorizado(req) {
+  const recebido =
+    (req.headers.authorization || '').replace('Bearer ', '') || req.query.token;
+  return recebido === TOKEN;
+}
 
 app.get('/saude', (req, res) => {
   res.json({ whatsapp: pronto });
 });
 
-app.post('/enviar', async (req, res) => {
-  const tokenRecebido =
-    (req.headers.authorization || '').replace('Bearer ', '') || req.query.token;
-  if (tokenRecebido !== TOKEN) {
-    return res.sendStatus(401);
-  }
+app.get('/qr', async (req, res) => {
+  if (!autorizado(req)) return res.sendStatus(401);
+  if (pronto) return res.send('WhatsApp já está conectado.');
+  if (!qrAtual) return res.send('Aguardando QR... a página recarrega sozinha.<meta http-equiv="refresh" content="3">');
 
-  
-  if (!pronto) {
-    return res.status(503).send('WhatsApp ainda não está pronto');
-  }
+  const imagem = await QRCode.toDataURL(qrAtual);
+  res.send(`<meta http-equiv="refresh" content="15"><img src="${imagem}" width="320">`);
+});
+
+app.post('/enviar', async (req, res) => {
+  if (!autorizado(req)) return res.sendStatus(401);
+  if (!pronto) return res.status(503).send('WhatsApp ainda não está pronto');
 
   const { titulo = '', texto = '' } = req.body || {};
   if (!titulo && !texto) {
@@ -69,8 +98,8 @@ app.post('/enviar', async (req, res) => {
   const mensagem = titulo ? `*${titulo}*\n${texto}` : texto;
 
   try {
-    await client.sendMessage(GRUPO_ID, mensagem);
-    console.log('Mensagem enviada:', mensagem.replace(/\n/g, ' | '));
+    await sock.sendMessage(GRUPO_ID, { text: mensagem });
+    console.log('Mensagem enviada');
     res.sendStatus(200);
   } catch (e) {
     console.error('Falha ao enviar:', e.message);
@@ -78,4 +107,6 @@ app.post('/enviar', async (req, res) => {
   }
 });
 
+await initDb();
+await conectar();
 app.listen(PORT, () => console.log(`API na porta ${PORT}`));
